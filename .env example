@@ -1,0 +1,44 @@
+# =========================
+
+# Bot Configuration
+
+# =========================
+
+BOT_TOKEN=YOUR_BOT_TOKEN
+MAILBOX_PASSWORD=YOUR_MAILBOX_PASSWORD
+
+# =========================
+
+# Google OAuth Configuration
+
+# =========================
+
+GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=YOUR_GOOGLE_CLIENT_SECRET
+REDIRECT_URI=https://your-domain.com/oauth_callback
+
+# =========================
+
+# Microsoft OAuth Configuration
+
+# =========================
+
+MS_CLIENT_ID=YOUR_MICROSOFT_CLIENT_ID
+MS_CLIENT_SECRET=YOUR_MICROSOFT_CLIENT_SECRET
+MS_REDIRECT_URI=https://your-domain.com/ms_callback
+
+# =========================
+
+# MongoDB Configuration
+
+# =========================
+
+MONGO_URI=mongodb+srv://USERNAME:PASSWORD@cluster.mongodb.net/DATABASE_NAME?retryWrites=true&w=majority&appName=APP_NAME
+
+# =========================
+
+# Webhook Configuration (for OAuth callback)
+
+# =========================
+
+PORT=3000
