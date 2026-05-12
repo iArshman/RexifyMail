@@ -29,8 +29,10 @@ class Database:
         await self.email_history.create_index([('user_id', 1), ('internal_date', -1)])
         await self.pagination_cache.create_index('cache_key', unique=True)
         await self.callback_data.create_index('created_at', expireAfterSeconds=604800)
+        await self.callback_data.create_index('hash', unique=True)  # Fast /view/{hash} lookups
         await self.auth_users.create_index('username', unique=True)
         await self.auth_users.create_index([('telegram_id', 1), ('is_logged_in', 1)])
+        await self.auth_users.create_index('internal_user_id')
     
     # ── User Operations ───────────────────────────────────────────────────────
 
@@ -212,32 +214,20 @@ class Database:
         )
         return await cursor.to_list(length=limit)
     
-    async def get_mailbox_emails_24h(self, user_id: int, page: int = 1, per_page: int = 25) -> tuple:
+    async def get_mailbox_emails_24h(self, user_id: int, page: int = 1, per_page: int = 100) -> tuple:
         """Return last 24h emails with pagination. Returns (emails, total_count, total_pages)."""
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
-        
-        # Count total emails in last 24h
-        total_count = await self.email_history.count_documents({
-            'user_id': user_id,
-            'internal_date': {'$gte': int(cutoff_time.timestamp() * 1000)}
-        })
-        
-        # Calculate pagination
+        import asyncio
+        cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+        query = {'user_id': user_id, 'internal_date': {'$gte': cutoff_ms}}
         skip = (page - 1) * per_page
-        total_pages = (total_count + per_page - 1) // per_page
-        
-        # Fetch paginated emails
-        cursor = self.email_history.find(
-            {
-                'user_id': user_id,
-                'internal_date': {'$gte': int(cutoff_time.timestamp() * 1000)}
-            },
-            sort=[('internal_date', -1)],
-            skip=skip,
-            limit=per_page
+
+        # Run count and fetch in parallel — saves one full DB round-trip latency
+        total_count, emails = await asyncio.gather(
+            self.email_history.count_documents(query),
+            self.email_history.find(query, sort=[('internal_date', -1)], skip=skip, limit=per_page).to_list(length=per_page)
         )
-        emails = await cursor.to_list(length=per_page)
-        
+
+        total_pages = (total_count + per_page - 1) // per_page
         return emails, total_count, total_pages
 
     async def is_email_notified(self, user_id: int, account_id: str, message_id: str) -> bool:
@@ -263,7 +253,7 @@ class Database:
     # ── Email Callback Data ───────────────────────────────────────────────────
 
     async def store_email_callback(self, user_id: int, account_id: str, message_id: str, thread_id: str = None) -> str:
-        data_str = f"{user_id}:{account_id}:{message_id}:{datetime.now(timezone.utc).timestamp()}"
+        data_str = f"{user_id}:{account_id}:{message_id}"
         cb_hash = hashlib.md5(data_str.encode()).hexdigest()[:16]
         await self.callback_data.update_one(
             {"hash": cb_hash},
@@ -272,6 +262,27 @@ class Database:
             upsert=True
         )
         return cb_hash
+
+    def generate_callback_hash(self, user_id: int, account_id: str, message_id: str) -> str:
+        """Generate callback hash without database write - for fast rendering"""
+        data_str = f"{user_id}:{account_id}:{message_id}"
+        return hashlib.md5(data_str.encode()).hexdigest()[:16]
+
+    async def store_email_callbacks_batch(self, callbacks: list) -> None:
+        """Store multiple email callbacks in a single bulk operation"""
+        if not callbacks:
+            return
+        from pymongo import UpdateOne
+        now = datetime.now(timezone.utc)
+        operations = []
+        for cb in callbacks:
+            operations.append(UpdateOne(
+                {"hash": cb['hash']},
+                {"$set": {"hash": cb['hash'], "user_id": cb['user_id'], "account_id": cb['account_id'],
+                          "message_id": cb['message_id'], "thread_id": cb.get('thread_id'), "created_at": now}},
+                upsert=True
+            ))
+        await self.callback_data.bulk_write(operations, ordered=False)
 
     async def get_email_callback(self, cb_hash: str) -> Optional[Dict]:
         return await self.callback_data.find_one({"hash": cb_hash})
