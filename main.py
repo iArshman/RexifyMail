@@ -21,6 +21,9 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import msal
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders as email_encoders
 
 # Ensure MS variables are imported from config
 from config import (
@@ -48,6 +51,53 @@ logger = logging.getLogger(__name__)
 
 async def get_current_user_id(telegram_id: int) -> int:
     return await db.get_internal_user_id(telegram_id)
+
+async def get_attachment_from_message(message: Message):
+    """Extract file_id, filename, and mime_type from a Telegram message if it has an attachment."""
+    if message.document:
+        f = message.document
+        return f.file_id, f.file_name or "attachment", f.mime_type or "application/octet-stream"
+    if message.photo:
+        f = message.photo[-1]  # Largest size
+        return f.file_id, "photo.jpg", "image/jpeg"
+    if message.audio:
+        f = message.audio
+        return f.file_id, f.file_name or "audio.mp3", f.mime_type or "audio/mpeg"
+    if message.video:
+        f = message.video
+        return f.file_id, f.file_name or "video.mp4", f.mime_type or "video/mp4"
+    return None, None, None
+
+async def build_mime_with_attachment(body_text: str, from_addr: str, to_addr: str,
+                                     subject: str, message: Message) -> MIMEMultipart | MIMEText:
+    """Build a MIME email, attaching a file from the Telegram message if present."""
+    file_id, filename, mime_type = await get_attachment_from_message(message)
+    if not file_id:
+        # Plain text — no attachment
+        msg = MIMEText(body_text)
+        msg['to'] = to_addr
+        msg['from'] = from_addr
+        msg['subject'] = subject
+        return msg
+
+    # Download the file bytes from Telegram
+    tg_file = await bot.get_file(file_id)
+    file_bytes = await bot.download_file(tg_file.file_path)
+    file_data = file_bytes.read() if hasattr(file_bytes, 'read') else bytes(file_bytes)
+
+    msg = MIMEMultipart()
+    msg['to'] = to_addr
+    msg['from'] = from_addr
+    msg['subject'] = subject
+    msg.attach(MIMEText(body_text or '(see attachment)'))
+
+    main_type, sub_type = (mime_type.split('/', 1) if '/' in mime_type else ('application', 'octet-stream'))
+    part = MIMEBase(main_type, sub_type)
+    part.set_payload(file_data)
+    email_encoders.encode_base64(part)
+    part.add_header('Content-Disposition', 'attachment', filename=filename)
+    msg.attach(part)
+    return msg
 
 def html_to_telegram(html_content: str) -> str:
     if not html_content:
@@ -126,9 +176,9 @@ async def call_ms_graph(endpoint: str, account: dict, method: str = "GET", json_
     url = f"https://graph.microsoft.com/v1.0/{endpoint}"
     async with ClientSession() as session:
         async with session.request(method, url, headers=headers, json=json_data) as resp:
-            if resp.status in [200, 201, 202]:
+            if resp.status in [200, 201]:
                 return await resp.json()
-            if resp.status == 204:
+            if resp.status in [202, 204]:
                 return True
             resp_text = await resp.text()
             raise Exception(f"Graph API Error {resp.status}: {resp_text}")
@@ -175,6 +225,27 @@ def get_email_body(payload) -> str:
     elif body_html:
         return html_to_telegram(body_html)
     return ""
+
+def get_gmail_attachments(payload) -> list:
+    """Recursively extract attachment metadata (name, attachment_id) from a Gmail message payload."""
+    attachments = []
+    def _parse(parts):
+        for part in parts:
+            fn = part.get('filename', '')
+            body = part.get('body', {})
+            att_id = body.get('attachmentId', '')
+            if fn and att_id:
+                attachments.append({
+                    'name': fn,
+                    'type': part.get('mimeType', 'application/octet-stream'),
+                    'size': body.get('size', 0),
+                    'attachment_id': att_id
+                })
+            if 'parts' in part:
+                _parse(part['parts'])
+    if 'parts' in payload:
+        _parse(payload['parts'])
+    return attachments
 
 async def store_email_data(account_id: str, message_id: str, thread_id: str = None) -> str:
     hash_value = hashlib.md5(f"{account_id}:{message_id}:{thread_id or ''}".encode()).hexdigest()[:16]
@@ -575,26 +646,36 @@ async def handle_user_input(message: Message):
             await message.answer("No account connected. Use /addaccount")
             del user_states[telegram_id]
             return
-            
+
+        body_text = message.text or message.caption or ''
         provider = default.get('provider', 'gmail')
         try:
             if provider == 'gmail':
                 service = get_gmail_service(default['access_token'], default.get('refresh_token'), default.get('expires_at'))
-                msg = MIMEText(message.text)
-                msg['to'] = state['to']
-                msg['subject'] = state['subject']
-                raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+                mime_msg = await build_mime_with_attachment(body_text, default['email'], state['to'], state['subject'], message)
+                raw = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
                 service.users().messages().send(userId='me', body={'raw': raw}).execute()
-            else: # Microsoft
+            else:  # Microsoft
+                file_id, filename, mime_type = await get_attachment_from_message(message)
                 payload = {
                     "message": {
                         "subject": state['subject'],
-                        "body": {"contentType": "Text", "content": message.text},
+                        "body": {"contentType": "Text", "content": body_text},
                         "toRecipients": [{"emailAddress": {"address": state['to']}}]
                     }
                 }
+                if file_id:
+                    tg_file = await bot.get_file(file_id)
+                    file_bytes = await bot.download_file(tg_file.file_path)
+                    file_data = file_bytes.read() if hasattr(file_bytes, 'read') else bytes(file_bytes)
+                    payload["message"]["attachments"] = [{
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": filename,
+                        "contentType": mime_type,
+                        "contentBytes": base64.b64encode(file_data).decode()
+                    }]
                 await call_ms_graph("me/sendMail", default, method="POST", json_data=payload)
-                
+
             await message.answer(f"✅ Email sent to <b>{escape_html(state['to'])}</b>", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Send error: {e}")
@@ -607,26 +688,36 @@ async def handle_user_input(message: Message):
             await message.answer("Account not found")
             del user_states[telegram_id]
             return
-            
+
+        body_text = message.text or message.caption or ''
         provider = account.get('provider', 'gmail')
         try:
             if provider == 'gmail':
                 service = get_gmail_service(account['access_token'], account.get('refresh_token'), account.get('expires_at'))
-                email_message = MIMEText(message.text)
-                email_message['to'] = state['reply_to']
-                email_message['subject'] = state['subject']
-                raw = base64.urlsafe_b64encode(email_message.as_bytes()).decode()
+                mime_msg = await build_mime_with_attachment(body_text, account['email'], state['reply_to'], state['subject'], message)
+                raw = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
                 send_body = {'raw': raw}
                 if state.get('thread_id'):
                     send_body['threadId'] = state['thread_id']
                 service.users().messages().send(userId='me', body=send_body).execute()
-            else: # Microsoft
+            else:  # Microsoft
+                file_id, filename, mime_type = await get_attachment_from_message(message)
                 payload = {
                     "message": {
                         "toRecipients": [{"emailAddress": {"address": state['reply_to']}}],
-                        "comment": message.text
+                        "comment": body_text
                     }
                 }
+                if file_id:
+                    tg_file = await bot.get_file(file_id)
+                    file_bytes = await bot.download_file(tg_file.file_path)
+                    file_data = file_bytes.read() if hasattr(file_bytes, 'read') else bytes(file_bytes)
+                    payload["message"]["attachments"] = [{
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": filename,
+                        "contentType": mime_type,
+                        "contentBytes": base64.b64encode(file_data).decode()
+                    }]
                 await call_ms_graph(f"me/messages/{state['message_id']}/reply", account, method="POST", json_data=payload)
 
             await message.answer(f"✅ Reply sent to <b>{escape_html(state['reply_to'])}</b>!", parse_mode="HTML")
@@ -1057,11 +1148,18 @@ async def check_new_emails():
                             if await db.is_email_notified(internal_user_id, account_id, msg['id']):
                                 continue
 
-                            msg_detail = service.users().messages().get(userId='me', id=msg['id']).execute()
+                            loop = asyncio.get_event_loop()
+                            msg_detail = await loop.run_in_executor(
+                                None,
+                                lambda mid=msg['id']: service.users().messages().get(userId='me', id=mid, format='full').execute()
+                            )
                             headers = msg_detail.get('payload', {}).get('headers', [])
                             from_addr = escape_html(get_header(headers, 'From'))
                             subject = escape_html(get_header(headers, 'Subject'))
                             snippet = escape_html(msg_detail.get('snippet', '')[:100])
+
+                            # Parse attachments from payload
+                            attachments = get_gmail_attachments(msg_detail.get('payload', {}))
 
                             text = (
                                 f"📧 <b>New Email — {escape_html(account['email'])}</b>\n\n"
@@ -1069,12 +1167,38 @@ async def check_new_emails():
                                 f"<b>Subject:</b> {subject}\n"
                                 f"<b>Preview:</b> {snippet}…"
                             )
+                            if attachments:
+                                att_names = ", ".join(a['name'] for a in attachments[:5])
+                                text += f"\n<b>Attachments:</b> {escape_html(att_names)}"
+
                             cb_hash = await store_email_data(account_id, msg['id'], msg.get('threadId'))
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[[
                                 InlineKeyboardButton(text="📖 View", callback_data=f"email:{cb_hash}")
                             ]])
                             await bot.send_message(telegram_id, text, parse_mode="HTML", reply_markup=keyboard)
-                            
+
+                            # Forward each attachment as a Telegram document
+                            for att in attachments:
+                                att_id = att.get('attachment_id')
+                                if not att_id:
+                                    continue
+                                try:
+                                    att_data = await loop.run_in_executor(
+                                        None,
+                                        lambda mid=msg['id'], aid=att_id: service.users().messages().attachments().get(
+                                            userId='me', messageId=mid, id=aid
+                                        ).execute()
+                                    )
+                                    file_bytes = base64.urlsafe_b64decode(att_data['data'])
+                                    from aiogram.types import BufferedInputFile
+                                    await bot.send_document(
+                                        telegram_id,
+                                        document=BufferedInputFile(file_bytes, filename=att['name']),
+                                        caption=f"Attachment from: {escape_html(get_header(headers, 'Subject'))}"
+                                    )
+                                except Exception as att_err:
+                                    logger.error(f"Failed to forward Gmail attachment {att['name']}: {att_err}")
+
                             await db.add_email_to_history(
                                 internal_user_id, account_id, msg['id'],
                                 thread_id=msg.get('threadId'),
@@ -1085,38 +1209,70 @@ async def check_new_emails():
                                 unread='UNREAD' in msg_detail.get('labelIds', []),
                                 account_email=account['email']
                             )
-                            
-                    else: # Microsoft
-                        data = await call_ms_graph("me/messages?$filter=isRead eq false&$top=5&$select=id,conversationId,subject,from,bodyPreview,receivedDateTime", account)
-                        
+
+                    else:  # Microsoft
+                        data = await call_ms_graph("me/messages?$filter=isRead eq false&$top=5&$select=id,conversationId,subject,from,bodyPreview,receivedDateTime,hasAttachments", account)
+
                         await db.mark_account_valid(account_id)
-                        
+
                         for msg in data.get('value', []):
                             if await db.is_email_notified(internal_user_id, account_id, msg['id']):
                                 continue
-                                
+
                             from_addr = escape_html(msg.get('from', {}).get('emailAddress', {}).get('name', 'Unknown'))
                             subject = escape_html(msg.get('subject', '(No Subject)'))
                             snippet = escape_html(msg.get('bodyPreview', '')[:100])
-                            
+
+                            # Fetch attachment list if present
+                            ms_attachments = []
+                            if msg.get('hasAttachments'):
+                                try:
+                                    atts_resp = await call_ms_graph(
+                                        f"me/messages/{msg['id']}/attachments?$select=id,name,contentType,size,contentBytes",
+                                        account
+                                    )
+                                    ms_attachments = atts_resp.get('value', [])
+                                except Exception as att_err:
+                                    logger.error(f"Failed to fetch MS attachments: {att_err}")
+
                             text = (
                                 f"Ⓜ️ <b>New Outlook Email — {escape_html(account['email'])}</b>\n\n"
                                 f"<b>From:</b> {from_addr}\n"
                                 f"<b>Subject:</b> {subject}\n"
                                 f"<b>Preview:</b> {snippet}…"
                             )
+                            if ms_attachments:
+                                att_names = ", ".join(a.get('name', 'file') for a in ms_attachments[:5])
+                                text += f"\n<b>Attachments:</b> {escape_html(att_names)}"
+
                             cb_hash = await store_email_data(account_id, msg['id'], msg.get('conversationId'))
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[[
                                 InlineKeyboardButton(text="📖 View", callback_data=f"email:{cb_hash}")
                             ]])
                             await bot.send_message(telegram_id, text, parse_mode="HTML", reply_markup=keyboard)
-                            
+
+                            # Forward each attachment as a Telegram document
+                            for att in ms_attachments:
+                                content_bytes = att.get('contentBytes')
+                                if not content_bytes:
+                                    continue
+                                try:
+                                    file_bytes = base64.b64decode(content_bytes)
+                                    from aiogram.types import BufferedInputFile
+                                    await bot.send_document(
+                                        telegram_id,
+                                        document=BufferedInputFile(file_bytes, filename=att.get('name', 'attachment')),
+                                        caption=f"Attachment from: {escape_html(msg.get('subject', ''))}"
+                                    )
+                                except Exception as att_err:
+                                    logger.error(f"Failed to forward MS attachment {att.get('name')}: {att_err}")
+
                             try:
                                 dt_obj = datetime.strptime(msg.get('receivedDateTime')[:19], "%Y-%m-%dT%H:%M:%S")
                                 ms_internal_date = int(dt_obj.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                            except:
+                            except Exception:
                                 ms_internal_date = int(time.time() * 1000)
-                                
+
                             await db.add_email_to_history(
                                 internal_user_id, account_id, msg['id'],
                                 thread_id=msg.get('conversationId'),
@@ -1221,6 +1377,10 @@ async def main():
     dp.message.register(cmd_compose, Command("compose"))
     dp.message.register(cmd_logout, Command("logout"))
     dp.message.register(handle_user_input, F.text)
+    dp.message.register(handle_user_input, F.document)
+    dp.message.register(handle_user_input, F.photo)
+    dp.message.register(handle_user_input, F.audio)
+    dp.message.register(handle_user_input, F.video)
     dp.callback_query.register(handle_callback)
 
     web_module.setup_web_module(bot, db, oauth_states, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
